@@ -1,75 +1,63 @@
---!native
---!optimize 2
 -- ML-KEM (FIPS 203), deterministic core: the caller supplies all randomness as 32-byte buffers.
--- All working memory is module-level scratch; only returned keys, ciphertexts and secrets are allocated.
 
 local Keccak = require("@self/Keccak")
 local Polynomial = require("@self/Polynomial")
-local MODULUS = 3329
 
-local message, expanded = buffer.create(1600), buffer.create(64) -- hash input; SHA3-512 output (ρ‖σ or key‖coins)
-local matrixSeed, noiseSeed, noiseBytes = buffer.create(34), buffer.create(33), buffer.create(196)
-local sampled, noise, scalar, candidate = buffer.create(512), buffer.create(512), buffer.create(512), buffer.create(1568)
-local secrets, products = {}, {} -- vectors, sized for the largest rank
-for index = 1, 4 do secrets[index], products[index] = buffer.create(512), buffer.create(512) end
+---- Bytes ----
 
----- Sampling ----
-
-local function sampleUniform() -- sampled ← SHAKE128(matrixSeed): two 12-bit candidates per 3 bytes of each output block
-	local sampled, block, squeeze = sampled, Keccak.block, Keccak.squeeze
-	Keccak.absorb(168, 0x1F, matrixSeed, 34)
-	local filled = 0
-	while true do
-		for offset = 0, 165, 3 do
-			local word = buffer.readu32(block, offset)
-			local first, second = bit32.band(word, 0xFFF), bit32.band(bit32.rshift(word, 12), 0xFFF)
-			if first < MODULUS then
-				buffer.writeu16(sampled, filled, first)
-				filled += 2
-				if filled == 512 then return end
-			end
-			if second < MODULUS then
-				buffer.writeu16(sampled, filled, second)
-				filled += 2
-				if filled == 512 then return end
-			end
-		end
-		squeeze(168)
-	end
+local function slice(source: buffer, offset: number, length: number): buffer
+	local part = buffer.create(length)
+	buffer.copy(part, 0, source, offset, length)
+	return part
 end
 
-local function sampleNoise(polynomial, eta, counter) -- centered binomial from SHAKE256(σ ‖ counter), bit-sliced popcounts
-	local noiseBytes = noiseBytes
-	buffer.writeu8(noiseSeed, 32, counter)
-	Keccak.hash(136, 0x1F, noiseSeed, 33, noiseBytes, 0, 64 * eta)
-	local pattern = if eta == 2 then 0x55555555 else 0x00249249 -- one bit per eta-bit field
-	local chunkBytes, lastShift, mask = if eta == 2 then 4 else 3, if eta == 2 then 28 else 18, 2 ^ eta - 1
-	local offset = 0
-	for byteOffset = 0, 64 * eta - chunkBytes, chunkBytes do
-		local word = buffer.readu32(noiseBytes, byteOffset)
-		local sums = bit32.band(word, pattern) + bit32.band(bit32.rshift(word, 1), pattern) -- per-field popcount
-		if eta == 3 then sums += bit32.band(bit32.rshift(word, 2), pattern) end
-		for shift = 0, lastShift, 2 * eta do
-			local plus, minus = bit32.band(bit32.rshift(sums, shift), mask), bit32.band(bit32.rshift(sums, shift + eta), mask)
-			buffer.writeu16(polynomial, offset, (plus - minus) % MODULUS)
-			offset += 2
-		end
-	end
-	return polynomial
+local function halves(bytes: buffer): (buffer, buffer) -- a 64-byte hash as two 32-byte values
+	return slice(bytes, 0, 32), slice(bytes, 32, 32)
 end
 
-local function multiplyMatrix(rank, transposed) -- products ← Â∘secrets (or Âᵀ), Â[row][column] = XOF(ρ ‖ column ‖ row)
-	local matrixSeed, sampled, secrets, products = matrixSeed, sampled, secrets, products
-	local sampleUniform, multiplyAccumulate = sampleUniform, Polynomial.multiplyAccumulate
-	for row = 1, rank do
-		buffer.fill(products[row], 0, 0)
-		for column = 1, rank do
-			buffer.writeu8(matrixSeed, 32, (if transposed then row else column) - 1)
-			buffer.writeu8(matrixSeed, 33, (if transposed then column else row) - 1)
-			sampleUniform()
-			multiplyAccumulate(products[row], sampled, secrets[column])
-		end
+local function concat(...: buffer): buffer
+	local length, offset = 0, 0
+	for _, part in { ... } do length += buffer.len(part) end
+	local joined = buffer.create(length)
+	for _, part in { ... } do
+		buffer.copy(joined, offset, part)
+		offset += buffer.len(part)
 	end
+	return joined
+end
+
+local function equal(left: buffer, right: buffer): boolean -- same lengths; inspects every byte, no early exit
+	local difference = 0
+	for index = 0, buffer.len(left) - 1 do
+		difference = bit32.bor(difference, bit32.bxor(buffer.readu8(left, index), buffer.readu8(right, index)))
+	end
+	return difference == 0
+end
+
+---- Hash functions (FIPS 203 §4.1): arguments are concatenated, each a buffer or a single byte ----
+
+local H, G, XOF = Keccak.sha3_256, Keccak.sha3_512, Keccak.shake128
+local function J(...) return Keccak.shake256(...):squeeze(32) end
+local function PRF(eta, seed, counter) return Keccak.shake256(seed, counter):squeeze(64 * eta) end
+
+---- Vectors and matrices of polynomials (plain arrays) ----
+
+local function vectorOf(rank: number, entry: (index: number) -> any)
+	local entries = table.create(rank)
+	for index = 1, rank do entries[index] = entry(index) end
+	return entries
+end
+
+local function dot(left, right) -- Σ left[i] ∘ right[i], both in the NTT domain
+	local sum = left[1] * right[1]
+	for index = 2, #left do sum += left[index] * right[index] end
+	return sum
+end
+
+local function transpose(matrix)
+	return vectorOf(#matrix, function(row)
+		return vectorOf(#matrix, function(column) return matrix[column][row] end)
+	end)
 end
 
 ---- Scheme ----
@@ -78,79 +66,81 @@ local function parameterSet(rank, eta1, eta2, uBits, vBits)
 	local keyBytes, vectorBytes = 384 * rank, 32 * uBits * rank
 	local ciphertextBytes = vectorBytes + 32 * vBits
 
-	local function encrypt(ciphertext, key, keyOffset, plaintext) -- K-PKE.Encrypt, coins = expanded[32, 64)
-		buffer.copy(noiseSeed, 0, expanded, 32, 32)
-		buffer.copy(matrixSeed, 0, key, keyOffset + keyBytes, 32)
-		for index = 1, rank do Polynomial.forwardTransform(sampleNoise(secrets[index], eta1, index - 1)) end
-		multiplyMatrix(rank, true)
-		buffer.fill(scalar, 0, 0)
-		for index = 1, rank do
-			local vectorTerm = Polynomial.add(Polynomial.inverseTransform(products[index]), sampleNoise(noise, eta2, rank + index - 1))
-			Polynomial.encode(ciphertext, (index - 1) * 32 * uBits, vectorTerm, uBits)
-			Polynomial.multiplyAccumulate(scalar, Polynomial.decode(sampled, key, keyOffset + (index - 1) * 384, 12), secrets[index])
-		end
-		Polynomial.add(Polynomial.inverseTransform(scalar), sampleNoise(noise, eta2, 2 * rank))
-		Polynomial.encode(ciphertext, vectorBytes, Polynomial.add(scalar, Polynomial.decode(noise, plaintext, 0, 1)), vBits)
+	local function noise(seed, eta, counter) -- SamplePolyCBD_η(PRF_η(seed, counter))
+		return Polynomial.sampleBinomial(PRF(eta, seed, counter), eta)
 	end
+
+	local function sampleMatrix(rho) -- Â[i][j] = SampleNTT(ρ ‖ j ‖ i), with i and j counted from 0
+		return vectorOf(rank, function(row)
+			return vectorOf(rank, function(column)
+				return Polynomial.sampleUniform(XOF(rho, column - 1, row - 1))
+			end)
+		end)
+	end
+
+	local function encodeVector(polynomials, bits)
+		return concat(table.unpack(vectorOf(rank, function(index) return polynomials[index]:encode(bits) end)))
+	end
+
+	local function decodeVector(bytes, bits) -- `rank` polynomials packed at the start of `bytes`
+		return vectorOf(rank, function(index) return Polynomial.decode(bytes, (index - 1) * 32 * bits, bits) end)
+	end
+
+	-- K-PKE (FIPS 203 §5)
+
+	local function generateEncryptionKeys(seed) -- K-PKE.KeyGen → encryptionKey = t̂ ‖ ρ, decryptionKey = ŝ
+		local rho, sigma = halves(G(seed, rank))
+		local matrix = sampleMatrix(rho)
+		local secret = vectorOf(rank, function(index) return noise(sigma, eta1, index - 1):ntt() end)
+		local public = vectorOf(rank, function(index) -- t̂ = Â∘ŝ + ê
+			return dot(matrix[index], secret) + noise(sigma, eta1, rank + index - 1):ntt()
+		end)
+		return concat(encodeVector(public, 12), rho), encodeVector(secret, 12)
+	end
+
+	local function encrypt(encryptionKey, plaintext, coins) -- K-PKE.Encrypt → ciphertext = u ‖ v
+		local public, rho = decodeVector(encryptionKey, 12), slice(encryptionKey, keyBytes, 32)
+		local matrix = transpose(sampleMatrix(rho))
+		local blinding = vectorOf(rank, function(index) return noise(coins, eta1, index - 1):ntt() end) -- ŷ
+		local u = vectorOf(rank, function(index) -- u = NTT⁻¹(Âᵀ∘ŷ) + e₁
+			return dot(matrix[index], blinding):inverseNtt() + noise(coins, eta2, rank + index - 1)
+		end)
+		local v = dot(public, blinding):inverseNtt() + noise(coins, eta2, 2 * rank) + Polynomial.decode(plaintext, 0, 1)
+		return concat(encodeVector(u, uBits), v:encode(vBits))
+	end
+
+	local function decrypt(decryptionKey, ciphertext) -- K-PKE.Decrypt → 32-byte plaintext
+		local secret, u = decodeVector(decryptionKey, 12), decodeVector(ciphertext, uBits)
+		local v = Polynomial.decode(ciphertext, vectorBytes, vBits)
+		local transformed = vectorOf(rank, function(index) return u[index]:ntt() end)
+		return (v - dot(secret, transformed):inverseNtt()):encode(1)
+	end
+
+	-- ML-KEM (FIPS 203 §6, internal algorithms)
 
 	local function generateKeys(seed, rejectionSeed) -- → encapsulationKey, decapsulationKey = ŝ ‖ ek ‖ H(ek) ‖ z
 		assert(buffer.len(seed) == 32 and buffer.len(rejectionSeed) == 32, "bad seed length")
-		buffer.copy(message, 0, seed)
-		buffer.writeu8(message, 32, rank)
-		Keccak.hash(72, 0x06, message, 33, expanded, 0, 64) -- ρ ‖ σ
-		buffer.copy(matrixSeed, 0, expanded, 0, 32)
-		buffer.copy(noiseSeed, 0, expanded, 32, 32)
-		local encapsulationKey, decapsulationKey = buffer.create(keyBytes + 32), buffer.create(2 * keyBytes + 96)
-		for index = 1, rank do
-			local secret = Polynomial.forwardTransform(sampleNoise(secrets[index], eta1, index - 1))
-			Polynomial.encode(decapsulationKey, (index - 1) * 384, secret, 12)
-		end
-		multiplyMatrix(rank, false)
-		for index = 1, rank do
-			local errorTerm = Polynomial.forwardTransform(sampleNoise(noise, eta1, rank + index - 1))
-			Polynomial.encode(encapsulationKey, (index - 1) * 384, Polynomial.add(products[index], errorTerm), 12)
-		end
-		buffer.copy(encapsulationKey, keyBytes, expanded, 0, 32)
-		buffer.copy(decapsulationKey, keyBytes, encapsulationKey)
-		Keccak.hash(136, 0x06, encapsulationKey, keyBytes + 32, decapsulationKey, 2 * keyBytes + 32, 32)
-		buffer.copy(decapsulationKey, 2 * keyBytes + 64, rejectionSeed)
-		return encapsulationKey, decapsulationKey
+		local encapsulationKey, decryptionKey = generateEncryptionKeys(seed)
+		return encapsulationKey, concat(decryptionKey, encapsulationKey, H(encapsulationKey), rejectionSeed)
 	end
 
 	local function encapsulate(encapsulationKey, randomness) -- → sharedSecret, ciphertext
 		assert(buffer.len(encapsulationKey) == keyBytes + 32 and buffer.len(randomness) == 32, "bad input length")
-		buffer.copy(message, 0, randomness)
-		Keccak.hash(136, 0x06, encapsulationKey, keyBytes + 32, message, 32, 32)
-		Keccak.hash(72, 0x06, message, 64, expanded, 0, 64) -- sharedSecret ‖ coins
-		local sharedSecret, ciphertext = buffer.create(32), buffer.create(ciphertextBytes)
-		buffer.copy(sharedSecret, 0, expanded, 0, 32)
-		encrypt(ciphertext, encapsulationKey, 0, randomness)
-		return sharedSecret, ciphertext
+		local sharedSecret, coins = halves(G(randomness, H(encapsulationKey)))
+		return sharedSecret, encrypt(encapsulationKey, randomness, coins)
 	end
 
 	local function decapsulate(decapsulationKey, ciphertext) -- → sharedSecret; implicit rejection on re-encryption mismatch
 		assert(buffer.len(decapsulationKey) == 2 * keyBytes + 96 and buffer.len(ciphertext) == ciphertextBytes, "bad input length")
-		local message, candidate = message, candidate
-		buffer.fill(scalar, 0, 0)
-		for index = 1, rank do
-			Polynomial.forwardTransform(Polynomial.decode(noise, ciphertext, (index - 1) * 32 * uBits, uBits))
-			Polynomial.multiplyAccumulate(scalar, Polynomial.decode(sampled, decapsulationKey, (index - 1) * 384, 12), noise)
-		end
-		Polynomial.add(Polynomial.decode(noise, ciphertext, vectorBytes, vBits), Polynomial.inverseTransform(scalar), -1)
-		Polynomial.encode(message, 0, noise, 1)
-		buffer.copy(message, 32, decapsulationKey, 2 * keyBytes + 32, 32)
-		Keccak.hash(72, 0x06, message, 64, expanded, 0, 64) -- sharedSecret ‖ coins
-		encrypt(candidate, decapsulationKey, keyBytes, message)
-		local difference = 0
-		for offset = 0, ciphertextBytes - 4, 4 do
-			difference = bit32.bor(difference, bit32.bxor(buffer.readu32(ciphertext, offset), buffer.readu32(candidate, offset)))
-		end
-		local sharedSecret = buffer.create(32) -- rejection value J(z ‖ ciphertext), always computed
-		buffer.copy(message, 0, decapsulationKey, 2 * keyBytes + 64, 32)
-		buffer.copy(message, 32, ciphertext)
-		Keccak.hash(136, 0x1F, message, 32 + ciphertextBytes, sharedSecret, 0, 32)
-		if difference == 0 then buffer.copy(sharedSecret, 0, expanded, 0, 32) end
-		return sharedSecret
+		local decryptionKey = slice(decapsulationKey, 0, keyBytes)
+		local encapsulationKey = slice(decapsulationKey, keyBytes, keyBytes + 32)
+		local keyHash = slice(decapsulationKey, 2 * keyBytes + 32, 32)
+		local rejectionSeed = slice(decapsulationKey, 2 * keyBytes + 64, 32)
+
+		local plaintext = decrypt(decryptionKey, ciphertext)
+		local sharedSecret, coins = halves(G(plaintext, keyHash))
+		local rejection = J(rejectionSeed, ciphertext) -- always computed
+		return if equal(ciphertext, encrypt(encapsulationKey, plaintext, coins)) then sharedSecret else rejection
 	end
 
 	return { generateKeys = generateKeys, encapsulate = encapsulate, decapsulate = decapsulate }
