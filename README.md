@@ -1,51 +1,52 @@
-ML-KEM for Luau
-
 <h1 align="left">ML-KEM · Luau</h1>
-
+ 
 <p align="left">
-<img src="https://img.shields.io/badge/First_of_its_Kind-Luau-181717?style=for-the-badge&logo=roblox&logoColor=white" />
 <img src="https://img.shields.io/badge/Post--Quantum-Cryptography-181717?style=for-the-badge&logo=letsencrypt&logoColor=white" />
 <img src="https://img.shields.io/badge/NIST-FIPS_203-181717?style=for-the-badge" />
-<img src="https://img.shields.io/badge/High_Performance-Optimized-181717?style=for-the-badge&logo=speedtest&logoColor=white" />
+<img src="https://img.shields.io/badge/Pure-Luau-181717?style=for-the-badge&logo=roblox&logoColor=white" />
 </p>
+A boring, somewhat readable implementation of ML-KEM (NIST FIPS 203) in pure Luau.
+ 
+## About
+ 
+ML-KEM (Module-Lattice-Based Key-Encapsulation Mechanism) is the post-quantum key exchange NIST standardised as FIPS 203.
+ 
+This is a boring re-implementation:
+ 
+It is not the first ML-KEM for Luau. [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) has had ML-KEM-512, 768 and 1024 since August 2025 and is considerably faster (see below). If you need ML-KEM in production, use that over this lying repo.
+ 
+## Correctness
+ 
+Tested against the NIST ACVP vectors for FIPS 203 (`ML-KEM-keyGen-FIPS203` and `ML-KEM-encapDecap-FIPS203`), all three parameter sets:
+ 
+| Test | Result |
+|---|---|
+| Key generation | 75 / 75 |
+| Encapsulation | 75 / 75 |
+| Decapsulation, valid and modified ciphertexts | 30 / 30 |
+| Rejects malformed encapsulation keys | 15 / 15 |
+| Rejects decapsulation keys with a modified hash | 0 / 15 |
+ 
+There is not decapsulation-key hash check from FIPS 203 which rbx crypto does have
+ 
+## Performance
 
-The first ML-KEM implementation ever built for Luau.
+| Operation | Time |
+|---|---|
+| ML-KEM-512 generateKeys | 5.2 ms |
+| ML-KEM-512 encapsulate | 5.2 ms |
+| ML-KEM-512 decapsulate | 5.6 ms |
 
-A native implementation of post quantum cryptography, bringing the next generation of cryptographic security to Luau through advanced mathematical engineering and the best runtime optimization.
+### Compared with rbx-cryptography
 
-Designed to push the boundaries of what's possible in Luau.
-
-About
-
-ML-KEM (Module-Lattice-Based Key-Encapsulation Mechanism), standardized under NIST FIPS 203, is a post-quantum cryptographic algorithm designed to withstand attacks from both classical and quantum computers.
-
-This project brings ML-KEM to Luau for the first time, implementing its underlying cryptographic constructions directly within the language.
-
-Built with performance as a priority, it aims to deliver exceptionally fast cryptographic operations in an environment rarely used for this class of cryptography.
-It trades blows with native libraries like OpenSSL, showing how remarkable the performance is!
-
-Performance
-
-Engineered for speed, with performance at the core of its implementation.
-https://dev.to/rukioyuza/building-the-first-mlkem-for-luau-37hh
-
-Focus
-
-<p>
-<img src="https://img.shields.io/badge/ML--KEM-181717?style=for-the-badge" />
-<img src="https://img.shields.io/badge/Lattice_Cryptography-181717?style=for-the-badge" />
-<img src="https://img.shields.io/badge/Polynomial_Arithmetic-181717?style=for-the-badge" />
-<img src="https://img.shields.io/badge/Luau_Optimization-181717?style=for-the-badge&logo=roblox&logoColor=white" />
-</p>
-
-First known ML-KEM implementation in Luau.
-High-performance cryptographic operations.
-Optimized polynomial and modular arithmetic.
-Post-quantum key encapsulation.
-Implementation based on NIST FIPS 203.
-Supported Parameter Sets
-ML-KEM-512
-ML-KEM-768
-ML-KEM-1024
-
-The first of its kind. Post-quantum cryptography at Luau speed.
+| Operation | rbx-cryptography | Ratio |
+|---|---|---|
+| ML-KEM-512 generateKeys | 28.9 µs | 180x slower |
+| ML-KEM-512 encapsulate | 33 µs | 158x slower |
+| ML-KEM-512 decapsulate | 51.8 µs | 108x slower |
+ 
+rbx-cryptography also passes all 210 of the ACVP cases above, including the decapsulation-key hash check.
+ 
+## Usage
+Don't use it, use https://github.com/daily3014/rbx-cryptography its faster, actually passes all tests and more secure
+ 
