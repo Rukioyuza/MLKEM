@@ -1,108 +1,137 @@
---!native
---!optimize 2
--- R_q = Z_q[X]/(X²⁵⁶+1): polynomials are 256 × u16 buffers, coefficients in [0, q).
+-- Polynomials in Z_q[X]/(X²⁵⁶ + 1), q = 3329 (FIPS 203 §4). Immutable: every operation returns a new polynomial.
+-- A polynomial is a table of 256 coefficients in [0, q), indexed 0..255 as in the specification.
+-- `+` and `-` work in either domain; `*` multiplies two polynomials that are both in the NTT domain.
 
-local MODULUS = 3329
+local MODULUS = 3329 -- q
+local ROOT = 17 -- ζ, a primitive 256th root of unity mod q
 
-local zetas = table.create(127, 0) -- zetas[bitReverse7(exponent)] = 17^exponent mod q
-do
-	local power = 1
-	for exponent = 1, 127 do
-		local reversed = 0
-		for position = 0, 6 do reversed += reversed + bit32.extract(exponent, position) end
-		power = power * 17 % MODULUS
-		zetas[reversed] = power
-	end
+local Polynomial = {}
+Polynomial.__index = Polynomial
+
+local function build(coefficient: (index: number) -> number) -- Σ coefficient(i)·Xⁱ, each reduced mod q
+	local polynomial = setmetatable({}, Polynomial)
+	for index = 0, 255 do polynomial[index] = coefficient(index) % MODULUS end
+	return polynomial
 end
 
-local function forwardTransform(polynomial) -- in place, Cooley-Tukey; span is in bytes
-	local zetas = zetas
-	local zetaIndex, span = 1, 256
-	while span >= 4 do
-		for start = 0, 511, 2 * span do
+---- Arithmetic ----
+
+function Polynomial.__add(left, right)
+	return build(function(index) return left[index] + right[index] end)
+end
+
+function Polynomial.__sub(left, right)
+	return build(function(index) return left[index] - right[index] end)
+end
+
+local function bitReverse7(value: number): number
+	local reversed = 0
+	for _ = 1, 7 do
+		reversed, value = 2 * reversed + value % 2, value // 2
+	end
+	return reversed
+end
+
+local function rootPower(exponent: number): number -- ζ^exponent mod q
+	local power = 1
+	for _ = 1, exponent do power = power * ROOT % MODULUS end
+	return power
+end
+
+local zetas, gammas = {}, {} -- zetas[i] = ζ^BitRev7(i) for the transforms, gammas[i] = ζ^(2·BitRev7(i) + 1) for products
+for index = 0, 127 do
+	zetas[index] = rootPower(bitReverse7(index))
+	gammas[index] = rootPower(2 * bitReverse7(index) + 1)
+end
+
+function Polynomial:ntt() -- NTT (Algorithm 9)
+	local result, zetaIndex, length = table.clone(self), 1, 128
+	while length >= 2 do
+		for start = 0, 255, 2 * length do
 			local zeta = zetas[zetaIndex]
 			zetaIndex += 1
-			for offset = start, start + span - 2, 2 do
-				local upper = zeta * buffer.readu16(polynomial, offset + span) % MODULUS
-				local lower = buffer.readu16(polynomial, offset)
-				buffer.writeu16(polynomial, offset, (lower + upper) % MODULUS)
-				buffer.writeu16(polynomial, offset + span, (lower - upper) % MODULUS)
+			for index = start, start + length - 1 do
+				local low, high = result[index], zeta * result[index + length]
+				result[index], result[index + length] = (low + high) % MODULUS, (low - high) % MODULUS
 			end
 		end
-		span /= 2
+		length //= 2
 	end
-	return polynomial
+	return result
 end
 
-local function inverseTransform(polynomial) -- in place, Gentleman-Sande; 3303 = 128⁻¹ mod q
-	local zetas = zetas
-	local zetaIndex, span = 127, 4
-	while span <= 256 do
-		for start = 0, 511, 2 * span do
+function Polynomial:inverseNtt() -- NTT⁻¹ (Algorithm 10); 3303 = 128⁻¹ mod q
+	local result, zetaIndex, length = table.clone(self), 127, 2
+	while length <= 128 do
+		for start = 0, 255, 2 * length do
 			local zeta = zetas[zetaIndex]
 			zetaIndex -= 1
-			for offset = start, start + span - 2, 2 do
-				local lower, upper = buffer.readu16(polynomial, offset), buffer.readu16(polynomial, offset + span)
-				buffer.writeu16(polynomial, offset, (lower + upper) % MODULUS)
-				buffer.writeu16(polynomial, offset + span, zeta * (upper - lower) % MODULUS)
+			for index = start, start + length - 1 do
+				local low, high = result[index], result[index + length]
+				result[index], result[index + length] = (low + high) % MODULUS, zeta * (high - low) % MODULUS
 			end
 		end
-		span *= 2
+		length *= 2
 	end
-	for offset = 0, 510, 2 do buffer.writeu16(polynomial, offset, buffer.readu16(polynomial, offset) * 3303 % MODULUS) end
-	return polynomial
+	return build(function(index) return result[index] * 3303 end)
 end
 
-local function multiplyAccumulate(sum, left, right) -- sum += left ∘ right over 128 × Z_q[X]/(X² ∓ ζ); stays < 2⁵³
-	local zetas = zetas
-	for offset = 0, 508, 4 do
-		local zeta = if offset % 8 == 0 then zetas[64 + offset // 8] else -zetas[64 + offset // 8]
-		local left0, left1 = buffer.readu16(left, offset), buffer.readu16(left, offset + 2)
-		local right0, right1 = buffer.readu16(right, offset), buffer.readu16(right, offset + 2)
-		buffer.writeu16(sum, offset, (buffer.readu16(sum, offset) + left0 * right0 + left1 * right1 * zeta) % MODULUS)
-		buffer.writeu16(sum, offset + 2, (buffer.readu16(sum, offset + 2) + left0 * right1 + left1 * right0) % MODULUS)
-	end
+function Polynomial.__mul(left, right) -- MultiplyNTTs (Algorithms 11-12): 128 products modulo X² − γ
+	return build(function(index)
+		local even = index - index % 2
+		local a0, a1, b0, b1 = left[even], left[even + 1], right[even], right[even + 1]
+		return if index % 2 == 0 then a0 * b0 + a1 * b1 * gammas[even // 2] else a0 * b1 + a1 * b0
+	end)
 end
 
-local function add(polynomial, other, sign) -- polynomial += sign · other, in place
-	sign = sign or 1
-	for offset = 0, 510, 2 do
-		buffer.writeu16(polynomial, offset, (buffer.readu16(polynomial, offset) + sign * buffer.readu16(other, offset)) % MODULUS)
-	end
-	return polynomial
+---- Encoding: d-bit coefficients, packed little-endian. d = 12 is exact; d < 12 is lossy compression ----
+
+local function compress(value: number, bits: number): number -- round(2ᵈ/q · value) mod 2ᵈ
+	return if bits == 12 then value else (value * 2 ^ bits + MODULUS // 2) // MODULUS % 2 ^ bits
 end
 
-local function encode(output, byteOffset, polynomial, bits) -- ByteEncode ∘ Compress (12 bits: raw), little-endian bit packing
-	local scale = 2 ^ bits
-	local pending, pendingBits = 0, 0
-	for offset = 0, 510, 2 do
-		local value = buffer.readu16(polynomial, offset)
-		if bits < 12 then value = (value * scale + 1664) // MODULUS % scale end
-		pending += bit32.lshift(value, pendingBits)
-		pendingBits += bits
-		while pendingBits >= 8 do
-			buffer.writeu8(output, byteOffset, bit32.band(pending, 0xFF))
-			pending = bit32.rshift(pending, 8)
-			pendingBits -= 8
-			byteOffset += 1
+local function decompress(value: number, bits: number): number -- round(q/2ᵈ · value)
+	return if bits == 12 then value else (value * MODULUS + 2 ^ (bits - 1)) // 2 ^ bits
+end
+
+function Polynomial:encode(bits: number): buffer -- ByteEncode_d ∘ Compress_d → 32·d bytes
+	local bytes = buffer.create(32 * bits)
+	for index = 0, 255 do
+		buffer.writebits(bytes, index * bits, bits, compress(self[index], bits))
+	end
+	return bytes
+end
+
+function Polynomial.decode(bytes: buffer, offset: number, bits: number) -- Decompress_d ∘ ByteDecode_d
+	return build(function(index)
+		local value = buffer.readbits(bytes, 8 * offset + index * bits, bits)
+		assert(bits < 12 or value < MODULUS, "non-canonical coefficient")
+		return decompress(value, bits)
+	end)
+end
+
+---- Sampling ----
+
+function Polynomial.sampleUniform(stream) -- SampleNTT (Algorithm 7): keep 12-bit candidates below q
+	local accepted = {}
+	while #accepted < 256 do
+		local bytes = stream:squeeze(3)
+		for _, candidate in { buffer.readbits(bytes, 0, 12), buffer.readbits(bytes, 12, 12) } do
+			if candidate < MODULUS then table.insert(accepted, candidate) end
 		end
 	end
+	return build(function(index) return accepted[index + 1] end)
 end
 
-local function decode(polynomial, input, byteOffset, bits) -- Decompress ∘ ByteDecode (12 bits: raw, canonical only)
-	local scale, lastRead = 2 ^ bits, buffer.len(input) - 4 -- clamp so the 4-byte read never leaves the buffer
-	local mask = scale - 1
-	for index = 0, 255 do
-		local bitOffset = byteOffset * 8 + index * bits
-		local readOffset = math.min(bitOffset // 8, lastRead)
-		local value = bit32.band(bit32.rshift(buffer.readu32(input, readOffset), bitOffset - readOffset * 8), mask)
-		if bits == 12 and value >= MODULUS then error("non-canonical coefficient") end
-		buffer.writeu16(polynomial, 2 * index, if bits < 12 then (value * MODULUS + scale / 2) // scale else value)
+function Polynomial.sampleBinomial(bytes: buffer, eta: number) -- SamplePolyCBD_η (Algorithm 8), from 64·η bytes
+	local function countBits(first: number): number -- set bits among `eta` bits starting at bit `first`
+		local count = 0
+		for bit = first, first + eta - 1 do count += buffer.readbits(bytes, bit, 1) end
+		return count
 	end
-	return polynomial
+	return build(function(index)
+		return countBits(2 * eta * index) - countBits(2 * eta * index + eta)
+	end)
 end
 
-return {
-	forwardTransform = forwardTransform, inverseTransform = inverseTransform,
-	multiplyAccumulate = multiplyAccumulate, add = add, encode = encode, decode = decode,
-}
+return Polynomial
